@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>马儿跑酷</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      background: #1a1a1a;
+      font-family: "Microsoft YaHei", sans-serif;
+      overflow: hidden;
+    }
+    canvas {
+      max-width: 100vw;
+      max-height: 88vh;
+      border-radius: 12px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+    }
+    #hint {
+      margin-top: 14px;
+      color: #bbb;
+      font-size: 18px;
+      letter-spacing: 2px;
+      background: rgba(0,0,0,0.4);
+      padding: 8px 26px;
+      border-radius: 24px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="1920" height="1080"></canvas>
+  <div id="hint">按空格键或点击屏幕开始 &nbsp;|&nbsp; P键 / ESC 暂停</div>
+
+  <script>
+/* ========== 常量配置区 ========== */
+const CANVAS_W = 800;
+const CANVAS_H = 300;
+const RENDER_SCALE = 2.4;
+const RENDER_OFFSET_Y = 1080 - CANVAS_H * RENDER_SCALE; // 360，游戏区域贴底
+const BG_COLOR = "#f5f0e8";
+const DEBUG_MODE = false;        // 调试模式：显示碰撞箱
+const HITBOX_SHRINK = 10;         // 碰撞箱四边缩小像素（适当宽松）
+const SHAKE_FRAMES = 10;         // 死亡抖动帧数
+const SHAKE_OFFSET = 4;          // 抖动位移像素
+const SETTLE_DELAY = 0.8;        // 结算界面延迟（秒）
+const STORAGE_KEY = "horseRun_bestScore"; // localStorage 键名
+const VISUAL_MODE = true;        // 视觉模式开关：false 时跳过所有装饰只渲染核心元素
+
+  /* ========== 云朵系统（远景视差 0.2x） ========== */
+  const clouds = [
+    { x: 100, y: 40, w: 80 },
+    { x: 350, y: 25, w: 100 },
+    { x: 620, y: 55, w: 70 },
+  ];
+
+  function updateClouds() {
+    if (!VISUAL_MODE) return;
+    const speed = (gameState.status === "running" || gameState.status === "jumping")
+      ? getEffectiveSpeed() * 0.2
+      : 0.3;
+    for (const c of clouds) {
+      c.x -= speed;
+      if (c.x + c.w < -20) {
+        c.x = CANVAS_W + 20 + Math.random() * 60;
+        c.y = 20 + Math.random() * 45;
+        c.w = 60 + Math.random() * 60;
+      }
+    }
+  }
+
+  function drawClouds() {
+    if (!VISUAL_MODE) return;
+    ctx.save();
+    ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+    for (const c of clouds) {
+      const r = c.w * 0.18;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, r * 1.1, 0, Math.PI * 2);
+      ctx.arc(c.x + r * 0.9, c.y - r * 0.4, r * 0.9, 0, Math.PI * 2);
+      ctx.arc(c.x + r * 1.6, c.y, r, 0, Math.PI * 2);
+      ctx.arc(c.x - r * 0.5, c.y + r * 0.15, r * 0.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /* ========== 山丘系统（中景视差 0.5x） ========== */
+  let hillOffset = 0;
+  const HILL_SEGMENTS = [
+    { cx: 80,  r: 130, h: 45 },
+    { cx: 250, r: 100, h: 35 },
+    { cx: 420, r: 150, h: 55 },
+    { cx: 580, r: 110, h: 40 },
+    { cx: 720, r: 130, h: 50 },
+  ];
+  const HILL_TILE = 800;
+
+  function updateHills() {
+    if (!VISUAL_MODE) return;
+    const speed = (gameState.status === "running" || gameState.status === "jumping")
+      ? getEffectiveSpeed() * 0.5
+      : 0;
+    hillOffset = (hillOffset + speed) % HILL_TILE;
+  }
+
+  function drawHills() {
+    if (!VISUAL_MODE) return;
+    const groundY = CANVAS_H - 40;
+    ctx.save();
+    ctx.fillStyle = "#a8c99b";
+    for (let rep = -1; rep <= 2; rep++) {
+      for (const seg of HILL_SEGMENTS) {
+        const cx = seg.cx + rep * HILL_TILE - hillOffset;
+        if (cx + seg.r < -10 || cx - seg.r > CANVAS_W + 10) continue;
+        ctx.beginPath();
+        ctx.moveTo(cx - seg.r, groundY);
+        ctx.quadraticCurveTo(cx, groundY - seg.h, cx + seg.r, groundY);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  /* ========== 小草系统（地面上方装饰） ========== */
+  let grassOffset = 0;
+
+  function updateGrass() {
+    if (!VISUAL_MODE) return;
+    const speed = (gameState.status === "running" || gameState.status === "jumping")
+      ? getEffectiveSpeed()
+      : 0;
+    grassOffset += speed;
+  }
+
+  function drawGrass() {
+    if (!VISUAL_MODE) return;
+    const groundY = CANVAS_H - 40;
+    ctx.save();
+    ctx.strokeStyle = "#5a8a3c";
+    ctx.lineWidth = 1.5;
+    ctx.lineCap = "round";
+    const spacing = 28;
+    const offset = grassOffset % spacing;
+    for (let x = -offset; x <= CANVAS_W + spacing; x += spacing) {
+      ctx.beginPath();
+      ctx.moveTo(x, groundY - 1);
+      ctx.lineTo(x - 3, groundY - 9);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x + 8, groundY - 1);
+      ctx.lineTo(x + 10, groundY - 7);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /* ========== 对话气泡（idle 状态） ========== */
+  function drawSpeechBubble() {
+    if (!VISUAL_MODE || gameState.status !== "idle") return;
+    const text = "来拍我呀～";
+    const bx = horse.x + 40;
+    const by = horse.y - horse.fontSize - 15;
+    ctx.save();
+    ctx.font = "14px 'Microsoft YaHei', sans-serif";
+    const tw = ctx.measureText(text).width;
+    const pw = tw + 18;
+    const ph = 26;
+    const rx = bx - pw / 2;
+    const ry = by - ph;
+    // 气泡背景
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.strokeStyle = "#bbb";
+    ctx.lineWidth = 1;
+    const cr = 8;
+    ctx.beginPath();
+    ctx.moveTo(rx + cr, ry);
+    ctx.lineTo(rx + pw - cr, ry);
+    ctx.quadraticCurveTo(rx + pw, ry, rx + pw, ry + cr);
+    ctx.lineTo(rx + pw, ry + ph - cr);
+    ctx.quadraticCurveTo(rx + pw, ry + ph, rx + pw - cr, ry + ph);
+    // 小三角指向马
+    ctx.lineTo(bx + 5, ry + ph);
+    ctx.lineTo(bx, by + 6);
+    ctx.lineTo(bx - 5, ry + ph);
+    ctx.lineTo(rx + cr, ry + ph);
+    ctx.quadraticCurveTo(rx, ry + ph, rx, ry + ph - cr);
+    ctx.lineTo(rx, ry + cr);
+    ctx.quadraticCurveTo(rx, ry, rx + cr, ry);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    // 文字
+    ctx.fillStyle = "#5a4a2a";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, bx, ry + ph / 2);
+    ctx.restore();
+  }
+
+  /* ========== 跑步尘点系统（每 4 帧一个） ========== */
+  let runningDustFrame = 0;
+  const runningDustDots = [];
+
+  function updateRunningDust() {
+    if (!VISUAL_MODE) { runningDustDots.length = 0; return; }
+    if (gameState.status === "running") {
+      runningDustFrame++;
+      if (runningDustFrame % 4 === 0) {
+        runningDustDots.push({
+          x: horse.x - 8 + Math.random() * 6,
+          y: horse.y + 2,
+          life: 1.0,
+        });
+      }
+    } else {
+      runningDustFrame = 0;
+    }
+    for (let i = runningDustDots.length - 1; i >= 0; i--) {
+      runningDustDots[i].life -= 0.06;
+      runningDustDots[i].x -= getEffectiveSpeed() * 0.3;
+      if (runningDustDots[i].life <= 0) runningDustDots.splice(i, 1);
+    }
+  }
+
+  function drawRunningDust() {
+    if (!VISUAL_MODE) return;
+    ctx.save();
+    for (const d of runningDustDots) {
+      ctx.globalAlpha = d.life * 0.45;
+      ctx.fillStyle = "#b8a070";
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /* ========== 跳跃残影系统（3 个渐隐 afterimage） ========== */
+  const afterimages = [];
+
+  function updateAfterimages() {
+    if (!VISUAL_MODE) { afterimages.length = 0; return; }
+    if (gameState.status !== "jumping") { afterimages.length = 0; return; }
+    if (gameState.frame % 4 === 0) {
+      afterimages.push({ x: horse.x + horse.wobbleOffset, y: horse.y, alpha: 0.6 });
+      while (afterimages.length > 3) afterimages.shift();
+    }
+    for (const a of afterimages) { a.alpha -= 0.03; }
+    for (let i = afterimages.length - 1; i >= 0; i--) {
+      if (afterimages[i].alpha <= 0) afterimages.splice(i, 1);
+    }
+  }
+
+  function drawAfterimages() {
+    if (!VISUAL_MODE) return;
+    for (const a of afterimages) {
+      ctx.save();
+      ctx.font = `${horse.fontSize}px serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.globalAlpha = Math.max(0, a.alpha) * 0.5;
+      ctx.fillStyle = unicornMode ? "#d8b0ff" : "#c8a870";
+      ctx.translate(a.x, 0);
+      ctx.scale(-1, 1);
+      ctx.fillText(horse.getEmoji(), 0, a.y);
+      ctx.restore();
+    }
+  }
+
+  /* ========== 跳跃物理常量 ========== */
+  const GRAVITY = 0.6;           // 重力加速度
+  const JUMP_FORCE = -13;        // 跳跃初速度（负值=向上）
+  const LONG_JUMP_BONUS = -3;    // 长按额外力度
+  const GROUND_Y = CANVAS_H - 40; // 地面 Y 坐标（与视觉地面一致）
+  const LONG_JUMP_THRESHOLD = 150; // 长按判定阈值（ms）
+
+  /* ========== 跳跃输入追踪 ========== */
+  const jumpInput = {
+    pressed: false,
+    pressTime: 0,
+    longJumpApplied: false,
+  };
+
+  /* ========== 尘土粒子系统 ========== */
+  const dustParticles = [];
+
+  function spawnDust(x, y) {
+    for (let i = 0; i < 5; i++) {
+      dustParticles.push({
+        x: x,
+        y: y,
+        vx: (Math.random() - 0.5) * 4,
+        vy: -Math.random() * 2 - 0.5,
+        life: 1.0,
+        radius: Math.random() * 3 + 2,
+      });
+    }
+  }
+
+  function updateDustParticles() {
+    for (let i = dustParticles.length - 1; i >= 0; i--) {
+      const p = dustParticles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.05;
+      p.life -= 0.04;
+      if (p.life <= 0) dustParticles.splice(i, 1);
+    }
+  }
+
+  function drawDustParticles() {
+    for (const p of dustParticles) {
+      ctx.save();
+      ctx.globalAlpha = p.life * 0.6;
+      ctx.fillStyle = "#b8a070";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  /* ========== 障碍物系统 ========== */
+  const obstacles = [];
+  let gameSpeed = 5;
+  let spawnInterval = 1500;          // 当前生成间隔（ms）
+  let lastSpawnTime = 0;             // 上次生成时间戳
+  let speedUpNotice = 0;             // 提速提示倒计时帧数
+  let lastSpeedUpScore = 0;          // 上次提速时的分数
+
+  // 障碍物类型定义
+  const OBSTACLE_TYPES = {
+    low:   { w: 22, h: 42,  color: "#8B4513", topColor: "#6B3410", label: "低栏" },
+    high:  { w: 22, h: 72,  color: "#4169E1", topColor: "#2a4faa", label: "高栏" },
+    wide:  { w: 48, h: 32,  color: "#2e8b2e", topColor: "#1a6b1a", label: "矮墙" },
+    spike: { w: 18, h: 55,  color: "#cc4400", topColor: "#aa2200", label: "尖柱" },
+  };
+
+  function spawnObstacle() {
+    const rand = Math.random();
+    let type;
+    if (rand < 0.35) type = "low";
+    else if (rand < 0.58) type = "high";
+    else if (rand < 0.73) type = "wide";
+    else if (rand < 0.86) type = "spike";
+    else type = "double";
+
+    const groundY = CANVAS_H - 40; // 地面线 Y（与 drawGround 一致）
+
+    if (type === "double") {
+      // 双栏：连续两个低栏，间距 70px
+      const def = OBSTACLE_TYPES.low;
+      const x1 = CANVAS_W + 20;
+      obstacles.push({ x: x1, w: def.w, h: def.h, color: def.color, topColor: def.topColor, type: "low" });
+      obstacles.push({ x: x1 + def.w + 70, w: def.w, h: def.h, color: def.color, topColor: def.topColor, type: "low" });
+    } else {
+      const def = OBSTACLE_TYPES[type];
+      obstacles.push({ x: CANVAS_W + 20, w: def.w, h: def.h, color: def.color, topColor: def.topColor, type });
+    }
+  }
+
+  function updateObstacles() {
+    // 移动（使用障碍物实际速度，可能被"老马识途"减速）
+    const obSpeed = getObstacleSpeed();
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      obstacles[i].x -= obSpeed;
+      // 移出画布左侧后移除
+      if (obstacles[i].x + obstacles[i].w < -10) {
+        obstacles.splice(i, 1);
+      }
+    }
+
+    // 生成新障碍
+    const now = Date.now();
+    if (now - lastSpawnTime >= spawnInterval) {
+      spawnObstacle();
+      lastSpawnTime = now;
+      // 下次间隔随机
+      spawnInterval = 1200 + Math.random() * 800;
+    }
+  }
+
+  function drawObstacles() {
+    const groundY = CANVAS_H - 40;
+    for (const ob of obstacles) {
+      const ox = ob.x, oy = groundY - ob.h, ow = ob.w, oh = ob.h;
+
+      // 阴影
+      ctx.save();
+      ctx.shadowColor = "rgba(0,0,0,0.3)";
+      ctx.shadowBlur = 5;
+      ctx.shadowOffsetX = 3;
+      ctx.shadowOffsetY = 2;
+
+      if (ob.type === "spike") {
+        // 尖柱：主体 + 顶部三角
+        const grad = ctx.createLinearGradient(ox, oy, ox + ow, oy);
+        grad.addColorStop(0, "#ff6622");
+        grad.addColorStop(1, "#aa2200");
+        ctx.fillStyle = grad;
+        ctx.fillRect(ox, oy + 12, ow, oh - 12);
+        // 顶部三角
+        ctx.beginPath();
+        ctx.moveTo(ox, oy + 12);
+        ctx.lineTo(ox + ow / 2, oy);
+        ctx.lineTo(ox + ow, oy + 12);
+        ctx.closePath();
+        ctx.fill();
+      } else if (ob.type === "wide") {
+        // 矮墙：砖块质感
+        const grad = ctx.createLinearGradient(ox, oy, ox, groundY);
+        grad.addColorStop(0, "#4aab4a");
+        grad.addColorStop(1, "#1a6b1a");
+        ctx.fillStyle = grad;
+        ctx.fillRect(ox, oy, ow, oh);
+        // 砖缝
+        ctx.strokeStyle = "rgba(0,0,0,0.2)";
+        ctx.lineWidth = 1;
+        for (let brickY = oy + 10; brickY < groundY; brickY += 10) {
+          ctx.beginPath(); ctx.moveTo(ox, brickY); ctx.lineTo(ox + ow, brickY); ctx.stroke();
+        }
+        ctx.beginPath(); ctx.moveTo(ox + ow/2, oy); ctx.lineTo(ox + ow/2, groundY); ctx.stroke();
+        // 顶部横条
+        ctx.fillStyle = ob.topColor;
+        ctx.fillRect(ox - 3, oy - 4, ow + 6, 6);
+      } else {
+        // low / high：栏杆样式
+        const isHigh = ob.type === "high";
+        const grad = ctx.createLinearGradient(ox, oy, ox + ow, oy);
+        grad.addColorStop(0, isHigh ? "#6080ee" : "#b06030");
+        grad.addColorStop(1, ob.color);
+        ctx.fillStyle = grad;
+        ctx.fillRect(ox, oy, ow, oh);
+        // 竖纹
+        ctx.strokeStyle = "rgba(255,255,255,0.15)";
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(ox + ow * 0.3, oy); ctx.lineTo(ox + ow * 0.3, groundY); ctx.stroke();
+        // 顶部横条
+        ctx.fillStyle = ob.topColor;
+        ctx.fillRect(ox - 5, oy - 4, ow + 10, 6);
+        ctx.fillStyle = "rgba(255,255,255,0.3)";
+        ctx.fillRect(ox - 5, oy - 4, ow + 10, 2);
+      }
+      ctx.restore();
+    }
+  }
+
+  function checkDifficulty() {
+    const score = Math.floor(gameState.score);
+    const threshold = Math.floor(score / 200);
+    const prevThreshold = Math.floor(lastSpeedUpScore / 200);
+    if (threshold > prevThreshold && score > 0) {
+      // 提速
+      gameSpeed = Math.min(gameSpeed + 0.5, 14);
+      spawnInterval = Math.max(spawnInterval - 80, 700);
+      speedUpNotice = 90; // 显示约 1.5 秒
+      lastSpeedUpScore = score;
+    }
+  }
+
+  /* ========== 碰撞检测系统 ========== */
+  // 获取马的碰撞箱（比视觉范围缩小 HITBOX_SHRINK 像素）
+  function getHorseHitbox() {
+    const halfSize = horse.fontSize / 2;
+    return {
+      x: horse.x - halfSize + HITBOX_SHRINK,
+      y: horse.y - horse.fontSize + HITBOX_SHRINK,
+      w: horse.fontSize - HITBOX_SHRINK * 2,
+      h: horse.fontSize - HITBOX_SHRINK * 2,
+    };
+  }
+
+  // 获取障碍物碰撞箱
+  function getObstacleHitbox(ob) {
+    const groundY = CANVAS_H - 40;
+    return {
+      x: ob.x,
+      y: groundY - ob.h,
+      w: ob.w,
+      h: ob.h,
+    };
+  }
+
+  // AABB 碰撞检测
+  function aabbCollision(a, b) {
+    return a.x < b.x + b.w &&
+           a.x + a.w > b.x &&
+           a.y < b.y + b.h &&
+           a.y + a.h > b.y;
+  }
+
+  // 检测马与所有障碍物的碰撞
+  function checkCollisions() {
+    if (invincibleFrames > 0) return; // 无敌帧内不检测碰撞
+    const horseBox = getHorseHitbox();
+    for (const ob of obstacles) {
+      const obBox = getObstacleHitbox(ob);
+      if (aabbCollision(horseBox, obBox)) {
+        triggerDeath();
+        return;
+      }
+    }
+  }
+
+  // 触发死亡流程
+  function triggerDeath() {
+    switchStatus("dead");
+    gameState.shakeTime = SHAKE_FRAMES;
+    gameState.deadTime = Date.now();
+    // 更新最高分
+    const finalScore = Math.floor(gameState.score);
+    if (finalScore > gameState.bestScore) {
+      gameState.bestScore = finalScore;
+      localStorage.setItem(STORAGE_KEY, gameState.bestScore);
+    }
+  }
+
+  // 绘制调试碰撞箱
+  function drawDebugHitboxes() {
+    if (!DEBUG_MODE) return;
+    // 马的碰撞箱
+    const horseBox = getHorseHitbox();
+    ctx.strokeStyle = "red";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(horseBox.x, horseBox.y, horseBox.w, horseBox.h);
+    // 障碍物碰撞箱
+    for (const ob of obstacles) {
+      const obBox = getObstacleHitbox(ob);
+      ctx.strokeRect(obBox.x, obBox.y, obBox.w, obBox.h);
+    }
+  }
+
+  function drawSpeedUpNotice() {
+    if (speedUpNotice <= 0) return;
+    speedUpNotice--;
+    const alpha = Math.min(speedUpNotice / 30, 1);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = "bold 30px 'Microsoft YaHei', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#e74c3c";
+    ctx.fillText("⚡ 提速！", CANVAS_W / 2, CANVAS_H / 2 - 50);
+    ctx.restore();
+  }
+
+  function drawSpeedInfo() {
+    if (gameState.status !== "running" && gameState.status !== "jumping") return;
+    ctx.save();
+    ctx.font = "12px monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#999";
+    ctx.fillText(`速度: ${getEffectiveSpeed().toFixed(1)}`, 20, 40);
+    ctx.restore();
+  }
+
+  function resetObstacles() {
+    obstacles.length = 0;
+    gameSpeed = 5;
+    spawnInterval = 1500;
+    lastSpawnTime = Date.now();
+    speedUpNotice = 0;
+    lastSpeedUpScore = 0;
+  }
+
+  /* ========== 成语彩蛋系统 ========== */
+  const IDIOM_EGGS = [
+    { score: 100,  text: "马到成功！", emoji: "🎊", name: "马到成功" },
+    { score: 300,  text: "一马当先！", emoji: "⚡", name: "一马当先" },
+    { score: 600,  text: "老马识途！", emoji: "🧭", name: "老马识途" },
+    { score: 1000, text: "万马奔腾！", emoji: "🌊", name: "万马奔腾" },
+    { score: 2000, text: "天马行空！", emoji: "✨", name: "天马行空" },
+  ];
+
+  // 彩蛋动画状态
+  const eggAnim = {
+    active: false,
+    egg: null,
+    startTime: 0,
+    duration: 1200, // 1.2秒（毫秒）
+  };
+
+  // 已触发彩蛋记录
+  let triggeredIdioms = [];
+
+  // 无敌帧计时（帧数）
+  let invincibleFrames = 0;
+
+  // 各彩蛋特效状态
+  let goldBgFrames = 0;        // 金色背景剩余帧
+  let sparkleFrames = 0;       // 闪光特效剩余帧
+  let slowObstacleFrames = 0;  // 障碍物减速剩余帧
+  let darkBgActive = false;    // 万马奔腾深色背景
+  let speedBonus = 0;          // 速度加成
+  let unicornMode = false;     // 天马行空独角兽模式
+
+  function getEffectiveSpeed() {
+    return gameSpeed + speedBonus;
+  }
+
+  function getObstacleSpeed() {
+    const base = getEffectiveSpeed();
+    return slowObstacleFrames > 0 ? base * 0.5 : base;
+  }
+
+  function tryTriggerIdiomEgg(score) {
+    for (const egg of IDIOM_EGGS) {
+      if (score >= egg.score && !triggeredIdioms.includes(egg.name)) {
+        triggeredIdioms.push(egg.name);
+        eggAnim.active = true;
+        eggAnim.egg = egg;
+        eggAnim.startTime = Date.now();
+        // 触发彩蛋给予0.5秒无敌帧（约30帧）
+        invincibleFrames = 30;
+        // 触发各彩蛋特效
+        applyIdiomEffect(egg);
+        return;
+      }
+    }
+  }
+
+  function applyIdiomEffect(egg) {
+    switch (egg.name) {
+      case "马到成功":
+        goldBgFrames = 90; // 约1.5秒金色背景
+        break;
+      case "一马当先":
+        sparkleFrames = 120; // 约2秒闪光特效
+        break;
+      case "老马识途":
+        slowObstacleFrames = 120; // 约2秒障碍物减速
+        break;
+      case "万马奔腾":
+        darkBgActive = true;
+        speedBonus += 2;
+        break;
+      case "天马行空":
+        unicornMode = true;
+        break;
+    }
+  }
+
+  function updateIdiomEffects() {
+    if (goldBgFrames > 0) goldBgFrames--;
+    if (sparkleFrames > 0) sparkleFrames--;
+    if (slowObstacleFrames > 0) slowObstacleFrames--;
+    if (invincibleFrames > 0) invincibleFrames--;
+  }
+
+  function drawIdiomAnimation() {
+    if (!eggAnim.active) return;
+    const elapsed = Date.now() - eggAnim.startTime;
+    if (elapsed >= eggAnim.duration) {
+      eggAnim.active = false;
+      eggAnim.egg = null;
+      return;
+    }
+
+    const progress = elapsed / eggAnim.duration; // 0 → 1
+    const egg = eggAnim.egg;
+
+    // 全屏半透明遮罩
+    ctx.save();
+    ctx.fillStyle = "rgba(0, 0, 0, 0.4)";
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // 成语文字从小变大弹出
+    const cx = CANVAS_W / 2;
+    const cy = CANVAS_H / 2;
+
+    // 缩放：前30%快速放大，后70%缓慢缩小+淡出
+    let scale, alpha;
+    if (progress < 0.3) {
+      scale = 0.3 + (progress / 0.3) * 1.2; // 0.3 → 1.5
+      alpha = 1;
+    } else {
+      const sub = (progress - 0.3) / 0.7;
+      scale = 1.5 - sub * 0.3; // 1.5 → 1.2
+      alpha = 1 - sub * 0.5;   // 1 → 0.5
+    }
+
+    ctx.globalAlpha = alpha;
+    ctx.font = `bold ${Math.round(40 * scale)}px 'Microsoft YaHei', sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    // 文字阴影
+    ctx.shadowColor = "rgba(0,0,0,0.5)";
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetX = 2;
+    ctx.shadowOffsetY = 2;
+
+    ctx.fillStyle = "#FFD700";
+    ctx.fillText(`${egg.emoji} ${egg.text}`, cx, cy);
+
+    ctx.restore();
+  }
+
+  function drawSparkleEffect() {
+    if (sparkleFrames <= 0) return;
+    const cx = horse.x;
+    const cy = horse.y - horse.fontSize / 2;
+    ctx.save();
+    // 绘制几个闪光点围绕马
+    const count = 6;
+    for (let i = 0; i < count; i++) {
+      const angle = (gameState.frame * 0.1 + i * Math.PI * 2 / count);
+      const radius = 25 + Math.sin(gameState.frame * 0.2 + i) * 8;
+      const px = cx + Math.cos(angle) * radius;
+      const py = cy + Math.sin(angle) * radius * 0.6;
+      const sparkAlpha = (sparkleFrames > 30) ? 1 : sparkleFrames / 30;
+      ctx.globalAlpha = sparkAlpha * (0.6 + Math.sin(gameState.frame * 0.3 + i) * 0.4);
+      ctx.fillStyle = "#FFD700";
+      ctx.beginPath();
+      ctx.arc(px, py, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /* ========== 状态管理区 ========== */
+  const gameState = {
+    status: "idle", // idle | running | jumping | dead
+    paused: false,  // 暂停标志
+    score: 0,
+    speed: 0,
+    frame: 0,       // 全局帧计数
+    shakeTime: 0,   // 死亡抖动计时
+    deadTime: 0,    // 死亡时间戳（用于结算延迟）
+    bestScore: parseInt(localStorage.getItem(STORAGE_KEY)) || 0,
+  };
+
+  /* ========== 马的角色系统 ========== */
+  const horse = {
+    x: 120,
+    baseY: CANVAS_H - 40,  // 站在视觉地面上
+    y: CANVAS_H - 40,
+    vy: 0,                  // 垂直速度
+    isOnGround: true,
+    fontSize: 48,
+    runFrame: 0,            // 跑步帧计数
+    breathOffset: 0,        // 呼吸偏移
+    wobbleOffset: 0,        // 晃动偏移
+
+    getEmoji() {
+      if (unicornMode && gameState.status !== "dead") return "🦄";
+      switch (gameState.status) {
+        case "jumping": return "🏇";
+        case "dead":    return "💥";
+        default:        return "🐎";
+      }
+    },
+
+    update() {
+      const st = gameState.status;
+      if (st === "idle") {
+        this.breathOffset = Math.sin(gameState.frame * 0.05) * 4;
+        this.y = this.baseY + this.breathOffset;
+      } else if (st === "running") {
+        this.wobbleOffset = Math.sin(gameState.frame * 0.3) * 3;
+        this.y = this.baseY;
+      } else if (st === "jumping") {
+        // 长按额外力度（只触发一次）
+        if (jumpInput.pressed && !jumpInput.longJumpApplied) {
+          if (Date.now() - jumpInput.pressTime >= LONG_JUMP_THRESHOLD) {
+            this.vy += LONG_JUMP_BONUS;
+            jumpInput.longJumpApplied = true;
+          }
+        }
+
+        // 跳跃物理
+        this.vy += GRAVITY;
+        this.y += this.vy;
+
+        // 落地检测
+        if (this.y >= GROUND_Y) {
+          this.y = GROUND_Y;
+          this.vy = 0;
+          this.isOnGround = true;
+          spawnDust(this.x, GROUND_Y); // 落地尘土
+          switchStatus("running");
+        }
+      } else if (st === "dead") {
+        if (gameState.shakeTime > 0) {
+          gameState.shakeTime--;
+        }
+      }
+    },
+
+    draw() {
+      // 跳跃阴影（越高越小越淡）
+      if (gameState.status === "jumping") {
+        const heightAboveGround = GROUND_Y - this.y;
+        const maxShadowHeight = Math.abs(JUMP_FORCE + LONG_JUMP_BONUS) ** 2 / (2 * GRAVITY);
+        const ratio = Math.min(heightAboveGround / maxShadowHeight, 1);
+        const shadowRadius = 20 * (1 - ratio * 0.6);
+        const shadowAlpha = 0.25 * (1 - ratio * 0.8);
+        ctx.save();
+        ctx.globalAlpha = shadowAlpha;
+        ctx.fillStyle = "#000";
+        ctx.beginPath();
+        ctx.ellipse(this.x, GROUND_Y + 5, shadowRadius, shadowRadius * 0.35, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      let drawX = this.x;
+      let drawY = this.y;
+
+      if (gameState.status === "running") {
+        drawX += this.wobbleOffset;
+        this.runFrame++;
+        if (this.runFrame % 16 < 8) {
+          drawY -= 3;
+        }
+      }
+
+      // Fix1: 水平翻转，让马面朝跑酷前方（右）
+      ctx.save();
+      ctx.font = `${this.fontSize}px serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.translate(drawX, 0);
+      ctx.scale(-1, 1);
+      ctx.fillText(this.getEmoji(), 0, drawY);
+      ctx.restore();
+    },
+
+    jump() {
+      if (!this.isOnGround) return;
+      this.vy = JUMP_FORCE;
+      this.isOnGround = false;
+      switchStatus("jumping");
+    },
+
+    reset() {
+      this.y = this.baseY;
+      this.vy = 0;
+      this.isOnGround = true;
+      this.runFrame = 0;
+      this.breathOffset = 0;
+      this.wobbleOffset = 0;
+    },
+  };
+
+  /* ========== 状态切换 ========== */
+  function switchStatus(newStatus) {
+    const prev = gameState.status;
+    gameState.status = newStatus;
+    console.log(`[状态切换] ${prev} → ${newStatus}`);
+  }
+
+  /* ========== 画布初始化 ========== */
+  const canvas = document.getElementById("gameCanvas");
+  const ctx = canvas.getContext("2d");
+  const hintEl = document.getElementById("hint");
+
+  /* ========== 渲染函数区 ========== */
+  function clearScreen() {
+    // 深色背景（万马奔腾）—— 直接覆盖
+    if (darkBgActive) {
+      ctx.fillStyle = "#3a3028";
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      return;
+    }
+    // 金色背景（马到成功）—— 渐变偏暖
+    if (goldBgFrames > 0) {
+      const t = goldBgFrames / 90;
+      const topR = Math.round(135 + (255 - 135) * t);
+      const topG = Math.round(206 + (215 - 206) * t);
+      const topB = Math.round(235 + (50 - 235) * t);
+      const botR = Math.round(245 + (255 - 245) * t);
+      const botG = Math.round(240 + (215 - 240) * t);
+      const botB = Math.round(232 + (0 - 232) * t);
+      const grad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+      grad.addColorStop(0, `rgb(${topR},${topG},${topB})`);
+      grad.addColorStop(1, `rgb(${botR},${botG},${botB})`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      return;
+    }
+    // 默认天空渐变背景（上浅蓝 → 下米白）
+    if (VISUAL_MODE) {
+      const grad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+      grad.addColorStop(0, "#87CEEB");
+      grad.addColorStop(1, "#f5f0e8");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    } else {
+      ctx.fillStyle = BG_COLOR;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    }
+  }
+
+  function drawGround() {
+    const groundY = CANVAS_H - 40;
+    // 深色土地填充
+    ctx.fillStyle = VISUAL_MODE ? "#6b5230" : "#d4bf8a";
+    ctx.fillRect(0, groundY, CANVAS_W, CANVAS_H - groundY);
+    // 棕色地面线
+    ctx.strokeStyle = VISUAL_MODE ? "#8B6914" : "#c2a86e";
+    ctx.lineWidth = VISUAL_MODE ? 3 : 2;
+    ctx.beginPath();
+    ctx.moveTo(0, groundY);
+    ctx.lineTo(CANVAS_W, groundY);
+    ctx.stroke();
+    // 地面纹理点
+    ctx.fillStyle = "#d4bf8a";
+    for (let i = 0; i < CANVAS_W; i += 30) {
+      ctx.fillRect(i, groundY + 6, 12, 2);
+    }
+  }
+
+  function drawDeadSettlement() {
+    if (gameState.status !== "dead") return;
+    if (gameState.shakeTime > 0) return;
+    if (Date.now() - gameState.deadTime < SETTLE_DELAY * 1000) return;
+
+    const cx = CANVAS_W / 2;
+    const cy = CANVAS_H / 2;
+
+    ctx.save();
+    // 半透明蒙版
+    ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // 结算面板背景
+    ctx.fillStyle = "rgba(20,15,10,0.75)";
+    ctx.beginPath();
+    ctx.roundRect(cx - 200, cy - 80, 400, triggeredIdioms.length > 0 ? 185 : 155, 14);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,200,60,0.35)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // 标题
+    ctx.font = "bold 32px 'Microsoft YaHei', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#ff6b6b";
+    ctx.shadowColor = "rgba(255,60,60,0.5)";
+    ctx.shadowBlur = 12;
+    ctx.fillText("💀 马失前蹄！", cx, cy - 48);
+    ctx.shadowBlur = 0;
+
+    // 分割线
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx - 160, cy - 22);
+    ctx.lineTo(cx + 160, cy - 22);
+    ctx.stroke();
+
+    // 本次得分
+    ctx.font = "bold 24px 'Microsoft YaHei', sans-serif";
+    ctx.fillStyle = "#f0d060";
+    ctx.fillText(`🏁 本次跑了 ${Math.floor(gameState.score)} 米`, cx, cy + 6);
+
+    // 是否破纪录
+    const isNewBest = Math.floor(gameState.score) >= gameState.bestScore && gameState.score > 0;
+    ctx.font = "16px 'Microsoft YaHei', sans-serif";
+    if (isNewBest) {
+      ctx.fillStyle = "#FFD700";
+      ctx.fillText(`🎉 新纪录！历史最远 ${gameState.bestScore} 米`, cx, cy + 34);
+    } else {
+      ctx.fillStyle = "#aaa";
+      ctx.fillText(`历史最远：${gameState.bestScore} 米`, cx, cy + 34);
+    }
+
+    // 本局解锁成语
+    if (triggeredIdioms.length > 0) {
+      ctx.fillStyle = "#FFD700";
+      ctx.font = "14px 'Microsoft YaHei', sans-serif";
+      ctx.fillText(`本局成语：${triggeredIdioms.join(" · ")}`, cx, cy + 62);
+    }
+
+    // 重新开始提示（闪烁）
+    const blink = Math.floor(Date.now() / 600) % 2 === 0;
+    if (blink) {
+      ctx.fillStyle = "#ccc";
+      ctx.font = "15px 'Microsoft YaHei', sans-serif";
+      const reY = triggeredIdioms.length > 0 ? cy + 90 : cy + 70;
+      ctx.fillText("▶ 按空格 / 点击 重新出发", cx, reY);
+    }
+
+    ctx.restore();
+  }
+
+  function drawScore() {
+    if (gameState.status !== "running" && gameState.status !== "jumping") return;
+    ctx.save();
+
+    // 当前分数（右上角带背景）
+    const scoreText = `${Math.floor(gameState.score)} 米`;
+    ctx.font = "bold 20px 'Microsoft YaHei', sans-serif";
+    const sw = ctx.measureText(scoreText).width;
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.beginPath();
+    ctx.roundRect(CANVAS_W - sw - 36, 8, sw + 26, 32, 8);
+    ctx.fill();
+    ctx.textAlign = "right";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#fff";
+    ctx.fillText(scoreText, CANVAS_W - 15, 15);
+
+    // 历史最远（右上角，稍小）
+    if (gameState.bestScore > 0) {
+      const bestText = `最远：${gameState.bestScore} 米`;
+      ctx.font = "13px 'Microsoft YaHei', sans-serif";
+      ctx.fillStyle = "rgba(255,255,255,0.75)";
+      ctx.fillText(bestText, CANVAS_W - 15, 44);
+    }
+
+    // 暂停提示（左上角，小字）
+    ctx.font = "12px 'Microsoft YaHei', sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(0,0,0,0.4)";
+    ctx.fillText("P 键暂停", 12, 14);
+
+    ctx.restore();
+  }
+
+  function drawPaused() {
+    if (!gameState.paused) return;
+    ctx.save();
+    // 半透明遮罩
+    ctx.fillStyle = "rgba(0,0,0,0.52)";
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    // 主标题
+    ctx.font = "bold 42px 'Microsoft YaHei', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#fff";
+    ctx.shadowColor = "rgba(0,0,0,0.5)";
+    ctx.shadowBlur = 10;
+    ctx.fillText("⏸ 游戏暂停", CANVAS_W / 2, CANVAS_H / 2 - 22);
+    ctx.shadowBlur = 0;
+    // 提示
+    ctx.font = "20px 'Microsoft YaHei', sans-serif";
+    ctx.fillStyle = "#ddd";
+    ctx.fillText("按 P 键 / ESC 继续", CANVAS_W / 2, CANVAS_H / 2 + 22);
+    // 当前分
+    ctx.font = "15px 'Microsoft YaHei', sans-serif";
+    ctx.fillStyle = "#f0d060";
+    ctx.fillText(`当前：${Math.floor(gameState.score)} 米`, CANVAS_W / 2, CANVAS_H / 2 + 55);
+    ctx.restore();
+  }
+
+  function render() {
+    // 画面抖动：通过 canvas 位移实现
+    const canvasEl = canvas;
+    if (gameState.status === "dead" && gameState.shakeTime > 0) {
+      const dir = gameState.shakeTime % 2 === 0 ? 1 : -1;
+      canvasEl.style.transform = `translateX(${dir * SHAKE_OFFSET}px)`;
+    } else {
+      canvasEl.style.transform = "";
+    }
+
+    // 4K 渲染：先以原生分辨率绘制扩展天空（游戏区域上方）
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const skyGrad = ctx.createLinearGradient(0, 0, 0, RENDER_OFFSET_Y);
+    skyGrad.addColorStop(0, "#6BB3D9");
+    skyGrad.addColorStop(1, "#87CEEB");
+    ctx.fillStyle = skyGrad;
+    ctx.fillRect(0, 0, canvas.width, RENDER_OFFSET_Y);
+
+    // 应用 4K 缩放变换，游戏逻辑坐标保持 800×300
+    ctx.setTransform(RENDER_SCALE, 0, 0, RENDER_SCALE, 0, RENDER_OFFSET_Y);
+
+    clearScreen();
+    drawClouds();
+    drawHills();
+    drawGround();
+    drawGrass();
+    drawObstacles();
+    drawAfterimages();
+    drawDustParticles();
+    drawRunningDust();
+    horse.draw();
+    drawSpeechBubble();
+    drawSparkleEffect();
+    drawDebugHitboxes();
+    drawIdiomAnimation();
+    drawDeadSettlement();
+    drawScore();
+    drawPaused();
+    drawSpeedInfo();
+    drawSpeedUpNotice();
+  }
+
+  /* ========== 游戏逻辑区 ========== */
+  function update() {
+    gameState.frame++;
+    horse.update();
+    updateDustParticles();
+    updateClouds();
+    updateHills();
+    updateGrass();
+    updateRunningDust();
+    updateAfterimages();
+
+    // 跑步中计分（每帧 +0.1，取整显示）
+    if (gameState.status === "running" || gameState.status === "jumping") {
+      gameState.score = Math.round((gameState.score + 0.1) * 10) / 10;
+      updateObstacles();
+      checkDifficulty();
+      checkCollisions();
+      tryTriggerIdiomEgg(Math.floor(gameState.score));
+      updateIdiomEffects();
+    }
+  }
+
+  /* ========== 游戏主循环 ========== */
+  function gameLoop() {
+    if (!gameState.paused) {
+      if (gameState.status === "running" || gameState.status === "jumping") {
+        update();
+      } else if (gameState.status === "idle") {
+        gameState.frame++;
+        horse.update();
+        updateClouds();
+        updateHills();
+      } else if (gameState.status === "dead") {
+        gameState.frame++;
+        horse.update();
+        updateClouds();
+        updateDustParticles();
+        updateRunningDust();
+        updateAfterimages();
+      }
+    }
+    render();
+    requestAnimationFrame(gameLoop);
+  }
+
+  /* ========== 事件监听区 ========== */
+  function resetEggStates() {
+    triggeredIdioms = [];
+    invincibleFrames = 0;
+    goldBgFrames = 0;
+    sparkleFrames = 0;
+    slowObstacleFrames = 0;
+    darkBgActive = false;
+    speedBonus = 0;
+    unicornMode = false;
+    eggAnim.active = false;
+    eggAnim.egg = null;
+  }
+
+  function resetVisualStates() {
+    hillOffset = 0;
+    grassOffset = 0;
+    runningDustFrame = 0;
+    runningDustDots.length = 0;
+    afterimages.length = 0;
+    clouds[0].x = 100; clouds[0].y = 40; clouds[0].w = 80;
+    clouds[1].x = 350; clouds[1].y = 25; clouds[1].w = 100;
+    clouds[2].x = 620; clouds[2].y = 55; clouds[2].w = 70;
+  }
+
+  function handleAction() {
+    const st = gameState.status;
+    if (st === "idle") {
+      // idle → running
+      switchStatus("running");
+      gameState.score = 0;
+      gameState.speed = 4;
+      gameState.paused = false;
+      resetObstacles();
+      resetEggStates();
+      resetVisualStates();
+      hintEl.textContent = "";
+    } else if (st === "running") {
+      // running → jumping
+      horse.jump();
+    } else if (st === "dead" && gameState.shakeTime <= 0) {
+      // dead → running（重来）
+      horse.reset();
+      gameState.score = 0;
+      gameState.speed = 4;
+      gameState.frame = 0;
+      gameState.paused = false;
+      resetObstacles();
+      resetEggStates();
+      resetVisualStates();
+      switchStatus("running");
+    }
+    // jumping 状态下空格无效
+  }
+
+  document.addEventListener("keydown", (e) => {
+    // P / ESC：暂停 & 继续
+    if (e.code === "KeyP" || e.code === "Escape") {
+      if (gameState.status === "running" || gameState.status === "jumping") {
+        gameState.paused = !gameState.paused;
+      }
+      return;
+    }
+    if (e.code === "Space") {
+      e.preventDefault();
+      // 若处于暂停，空格也可以恢复
+      if (gameState.paused) {
+        gameState.paused = false;
+        return;
+      }
+      if (!e.repeat) {
+        jumpInput.pressed = true;
+        jumpInput.pressTime = Date.now();
+        jumpInput.longJumpApplied = false;
+        handleAction();
+      }
+    }
+  });
+
+  document.addEventListener("keyup", (e) => {
+    if (e.code === "Space") {
+      jumpInput.pressed = false;
+    }
+  });
+
+  canvas.addEventListener("click", () => {
+    // 若正在游戏中，点击画布切换暂停
+    if (gameState.status === "running" || gameState.status === "jumping") {
+      if (gameState.paused) { gameState.paused = false; return; }
+    }
+    if (!gameState.paused) handleAction();
+  });
+
+  /* ========== 启动 ========== */
+  gameLoop();
+  </script>
+</body>
+</html>
